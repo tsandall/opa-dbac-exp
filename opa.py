@@ -10,40 +10,63 @@ class Decision(object):
 
 
 def query(input, unknowns, from_table=None):
-    response = requests.get('http://localhost:8181/v1/query', params={
-        'q': 'data.example.allow=true',
-        'unknown': ','.join(['data.' + u for u in unknowns]),
-        'input': json.dumps(input),
-    })
+    params = [
+        ('q', 'data.example.allow=true'),
+        ('input', json.dumps(input)),
+    ]
+    for u in unknowns:
+        params.append(('unknown', 'data.' + u))
+    response = requests.get('http://localhost:8181/v1/query', params=params)
     body = response.json()
     if 'partial' not in body:
         # Special case for partial result that indicates ALWAYS false.
         return Decision(False, None)
-    return Decision(True, translate_to_sql(RegoQuerySet.from_data(body['partial'])))
+    return Decision(True, translate_to_sql(RegoQuerySet.from_data(body['partial']), from_table=from_table))
 
 
-def translate_to_sql(query_set):
+def translate_to_sql(query_set, from_table=None):
 
     if len(query_set.queries) == 1 and len(query_set.queries[0].exprs) == 0:
-        print "skip"
         # Special case for partial result that indicates ALWAYS true.
         return None
 
-    class unknownCounter(object):
+    class tableCollector(object):
         def __init__(self):
-            self.tables = set([])
+            self.tables_in_query = []
 
         def __call__(self, node):
-            if isinstance(node, RegoRef):
-                self.tables.add(node.operand(1))
+            if isinstance(node, RegoQuery):
+                self.tables_in_query.append(set([]))
+            elif isinstance(node, RegoExpr):
+                # Manually walk over the operands to skip the operator.
+                for o in node.operands:
+                    walk_rego(o, self)
+                return None
+            elif isinstance(node, RegoRef):
+                idx = len(self.tables_in_query)-1
+                self.tables_in_query[idx].add(node.operand(1).value.value)
+                return None
+            return self
 
-    vis = unknownCounter()
+    vis = tableCollector()
+    pp_rego(query_set)
     walk_rego(query_set, vis)
 
-    if len(vis.tables) > 1:
-        raise ValueError("requires join")
+    filters = []
 
-    return SQLWherePredicate(_rego_to_sql_disjunction(query_set))
+    for i, q in enumerate(query_set.queries):
+        # If the query refers to multiple tables, make a JOIN. Otherwise, make a WHERE.
+        tables = vis.tables_in_query[i]
+        if len(tables) > 1:
+            tables.remove(from_table)
+            expr = _rego_to_sql_conjunction(q)
+            filters.append(SQLJoinPredicate(
+                SQLJoinPredicate.INNER, tables, expr))
+        else:
+            filters.append(SQLWherePredicate(
+                _rego_to_sql_conjunction(q)))
+
+    return SQLUnion(filters)
 
 
 def _rego_to_sql_disjunction(query_set):
@@ -62,18 +85,24 @@ def _rego_to_sql_expr(expr):
 
 
 def _rego_to_sql_relation_expr(operator, lhs, rhs):
-    if isinstance(lhs.value, RegoRef):
-        return SQLRelation(operator, _rego_to_sql_col(lhs.value), SQLConstant(rhs.value.value))
-    elif isinstance(rhs.value, RegoRef):
-        return SQLRelation(operator, _rego_to_sql_col(rhs.value), SQLConstant(lhs.value.value))
-    else:
-        raise ValueError("bad relation operands")
+    lhs = REGO_TO_SQL_OPERAND_MAP[lhs.value.__class__](lhs.value)
+    rhs = REGO_TO_SQL_OPERAND_MAP[rhs.value.__class__](rhs.value)
+    return SQLRelation(operator, lhs, rhs)
 
 
-def _rego_to_sql_col(ref):
+def _rego_to_sql_column(ref):
     if len(ref.terms) == 3:
         return SQLColumn(ref.terms[2].value.value, ref.terms[1].value.value)
     raise ValueError("bad column name")
+
+
+def _rego_to_sql_constant(scalar):
+    return SQLConstant(scalar.value)
+
+
+class SQLUnion(object):
+    def __init__(self, clauses):
+        self.clauses = clauses
 
 
 class SQLJoinPredicate(object):
@@ -84,11 +113,8 @@ class SQLJoinPredicate(object):
         self.tables = tables
         self.expr = expr
 
-    def sql(self, include_join=False):
-        s = ''
-        if include_join:
-            s = ' '.join([self.type + ' ' + t for t in self.tables]) + ' ON '
-        return s + s.expr.sql()
+    def sql(self):
+        return ' '.join([self.type + ' ' + t for t in self.tables]) + ' ON ' + self.expr.sql()
 
 
 class SQLWherePredicate(object):
@@ -96,7 +122,7 @@ class SQLWherePredicate(object):
         self.expr = expr
 
     def sql(self):
-        return self.expr.sql()
+        return 'WHERE ' + self.expr.sql()
 
 
 class SQLDisjunction(object):
@@ -154,11 +180,6 @@ class SQLRelationOp(object):
         return self.value
 
 
-REGO_TO_SQL_OPERATOR_MAP = {
-    'eq': SQLRelationOp('='),
-}
-
-
 def walk_sql(node, vis):
     next = vis(node)
     if next is None:
@@ -209,6 +230,9 @@ class RegoQuery(object):
     def from_data(cls, data):
         return cls(*[RegoExpr.from_data(e) for e in data])
 
+    def __str__(self):
+        return self.__class__.__name__
+
 
 class RegoQuery(object):
     def __init__(self, *exprs):
@@ -217,6 +241,9 @@ class RegoQuery(object):
     @classmethod
     def from_data(cls, data):
         return cls(*[RegoExpr.from_data(e) for e in data])
+
+    def __str__(self):
+        return self.__class__.__name__
 
 
 class RegoExpr(object):
@@ -232,6 +259,9 @@ class RegoExpr(object):
         terms = data["terms"]
         return cls(RegoTerm.from_data(terms[0]), *[RegoTerm.from_data(t) for t in terms[1:]])
 
+    def __str__(self):
+        return self.__class__.__name__
+
 
 class RegoTerm(object):
     def __init__(self, value):
@@ -240,6 +270,9 @@ class RegoTerm(object):
     @classmethod
     def from_data(cls, data):
         return cls(REGO_VALUE_MAP[data["type"]].from_data(data["value"]))
+
+    def __str__(self):
+        return self.__class__.__name__
 
 
 class RegoScalar(object):
@@ -250,6 +283,9 @@ class RegoScalar(object):
     def from_data(cls, data):
         return cls(data)
 
+    def __str__(self):
+        return 'RegoScalar - ' + self.value
+
 
 class RegoVar(object):
     def __init__(self, value):
@@ -259,14 +295,23 @@ class RegoVar(object):
     def from_data(cls, data):
         return cls(data)
 
+    def __str__(self):
+        return 'RegoVar - ' + self.value
+
 
 class RegoRef(object):
     def __init__(self, *terms):
         self.terms = terms
 
+    def operand(self, idx):
+        return self.terms[idx]
+
     @classmethod
     def from_data(cls, data):
         return cls(*[RegoTerm.from_data(x) for x in data])
+
+    def __str__(self):
+        return self.__class__.__name__
 
 
 class RegoArray(object):
@@ -277,6 +322,9 @@ class RegoArray(object):
     def from_data(cls, data):
         return cls(*[RegoTerm.from_data(x) for x in data])
 
+    def __str__(self):
+        return self.__class__.__name__
+
 
 class RegoSet(object):
     def __init__(self, *terms):
@@ -286,6 +334,9 @@ class RegoSet(object):
     def from_data(cls, data):
         return cls(*[RegoTerm.from_data(x) for x in data])
 
+    def __str__(self):
+        return self.__class__.__name__
+
 
 class RegoObject(object):
     def __init__(self, *pairs):
@@ -294,6 +345,9 @@ class RegoObject(object):
     @classmethod
     def from_method(cls, data):
         return cls(*[(RegoTerm.from_data(p[0]), RegoTerm.from_data(p[1])) for p in data])
+
+    def __str__(self):
+        return self.__class__.__name__
 
 
 REGO_VALUE_MAP = {
@@ -306,6 +360,15 @@ REGO_VALUE_MAP = {
     "array": RegoArray,
     "set": RegoSet,
     "object": RegoObject,
+}
+
+REGO_TO_SQL_OPERATOR_MAP = {
+    'eq': SQLRelationOp('='),
+}
+
+REGO_TO_SQL_OPERAND_MAP = {
+    RegoRef: _rego_to_sql_column,
+    RegoScalar: _rego_to_sql_constant,
 }
 
 
@@ -341,7 +404,7 @@ def pp_rego(node):
             self.indent = indent
 
         def __call__(self, node):
-            print ' ' * self.indent, node.__class__.__name__
+            print ' ' * self.indent, node
             return printer(self.indent+2)
 
     vis = printer(0)
